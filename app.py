@@ -76,21 +76,18 @@ def is_postgres():
     return get_engine().dialect.name == "postgresql"
 
 
-# Wat er staat, blijft staan. De database weigert zelf elke verwijdering of
-# wijziging, ook als de app-code ooit verandert.
-SLOTEN = [
-    ("keuzes_niet_verwijderen", "keuzes", "DELETE",
-     "Keuzes kunnen niet worden verwijderd."),
-    ("keuzes_niet_wijzigen", "keuzes", "UPDATE",
-     "Keuzes kunnen niet worden gewijzigd."),
-    ("personen_niet_verwijderen", "personen", "DELETE",
-     "Personen kunnen niet worden verwijderd."),
+# Eerdere versies zetten sloten op de tabellen die verwijderen tegenhielden.
+# Keuzes mogen weer weg, dus die sloten worden opgeruimd.
+OUDE_SLOTEN = [
+    ("keuzes_niet_verwijderen", "keuzes"),
+    ("keuzes_niet_wijzigen", "keuzes"),
+    ("personen_niet_verwijderen", "personen"),
 ]
 
 
 @st.cache_resource
 def init_db():
-    """Maakt tabellen en sloten aan. Loopt eenmaal per serverproces."""
+    """Maakt de tabellen aan. Loopt eenmaal per serverproces."""
     with get_engine().begin() as conn:
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS personen (
@@ -107,41 +104,17 @@ def init_db():
         """)
 
         if is_postgres():
-            conn.exec_driver_sql("""
-                CREATE OR REPLACE FUNCTION weiger_wijziging()
-                RETURNS trigger AS $weiger$
-                BEGIN
-                    RAISE EXCEPTION USING MESSAGE = TG_ARGV[0];
-                END;
-                $weiger$ LANGUAGE plpgsql
-            """)
+            for slot, tabel in OUDE_SLOTEN:
+                conn.exec_driver_sql(
+                    f"DROP TRIGGER IF EXISTS {slot} ON {tabel}"
+                )
 
-            for slot, tabel, actie, melding in SLOTEN:
-                bestaat = conn.execute(
-                    text(
-                        "SELECT 1 FROM pg_trigger WHERE tgname = :slot"
-                    ),
-                    {"slot": slot}
-                ).first()
-
-                if bestaat:
-                    continue
-
-                conn.exec_driver_sql(f"""
-                    CREATE TRIGGER {slot}
-                    BEFORE {actie} ON {tabel}
-                    FOR EACH STATEMENT
-                    EXECUTE FUNCTION weiger_wijziging('{melding}')
-                """)
+            conn.exec_driver_sql(
+                "DROP FUNCTION IF EXISTS weiger_wijziging()"
+            )
         else:
-            for slot, tabel, actie, melding in SLOTEN:
-                conn.exec_driver_sql(f"""
-                    CREATE TRIGGER IF NOT EXISTS {slot}
-                    BEFORE {actie} ON {tabel}
-                    BEGIN
-                        SELECT RAISE(ABORT, '{melding}');
-                    END
-                """)
+            for slot, _tabel in OUDE_SLOTEN:
+                conn.exec_driver_sql(f"DROP TRIGGER IF EXISTS {slot}")
 
 
 def get_personen():
@@ -195,7 +168,6 @@ def get_keuzes(naam=None):
 
 
 def voeg_keuze_toe(naam, session_id):
-    """Legt een keuze vast. Toevoegen kan; weghalen niet."""
     with get_engine().begin() as conn:
         resultaat = conn.execute(
             text("""
@@ -207,6 +179,25 @@ def voeg_keuze_toe(naam, session_id):
         )
 
     return resultaat.rowcount > 0
+
+
+def verwijder_keuze(naam, session_id):
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM keuzes
+                WHERE naam = :naam AND session_id = :session_id
+            """),
+            {"naam": naam, "session_id": int(session_id)}
+        )
+
+
+def wis_keuzes_persoon(naam):
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("DELETE FROM keuzes WHERE naam = :naam"),
+            {"naam": naam}
+        )
 
 
 def tijd_naar_minuten(tijd):
@@ -509,7 +500,7 @@ with st.expander("Ben jij dit niet?"):
 # -----------------------------
 # Keuze bevestigen
 # -----------------------------
-@st.dialog("Sessie vastleggen")
+@st.dialog("Deze sessies overlappen")
 def bevestig_keuze(naam, session_id):
     sessie = data.loc[data["session_id"] == session_id].iloc[0]
 
@@ -522,23 +513,20 @@ def bevestig_keuze(naam, session_id):
     conflicten = conflicten_voor_persoon(naam, session_id)
 
     if conflicten:
-        st.warning(
-            "Dit overlapt met een sessie die je al hebt vastgelegd:"
-        )
+        st.warning("Dit valt over een sessie die je al gekozen hebt:")
 
         for conflict in conflicten:
             st.write(f"• {conflict}")
 
-    st.info(
-        "Let op: vastleggen is definitief. Je kunt deze keuze daarna niet "
-        "meer weghalen."
+    st.caption(
+        "Je kunt allebei kiezen en later alsnog een van de twee weghalen."
     )
 
     col_ja, col_nee = st.columns(2)
 
     with col_ja:
         if st.button(
-            "Definitief vastleggen",
+            "Toch kiezen",
             type="primary",
             width="stretch"
         ):
@@ -561,9 +549,19 @@ def bevestig_keuze(naam, session_id):
 st.divider()
 st.subheader(f"2. Sessies kiezen voor {actieve_persoon}")
 st.caption(
-    "Een keuze die je vastlegt blijft staan: verwijderen kan niet. "
-    "Je krijgt daarom eerst een bevestiging te zien."
+    "Klik op \"Gaat hierheen\" om je aan te melden. Klik nog eens op een "
+    "gekozen sessie om je keuze weer weg te halen."
 )
+
+with st.expander("Al mijn keuzes in één keer wissen"):
+    st.caption(
+        f"Dit haalt alleen de keuzes van {actieve_persoon} weg; die van je "
+        "collega's blijven staan. Je kunt daarna gewoon opnieuw kiezen."
+    )
+
+    if st.button("Wis al mijn keuzes"):
+        wis_keuzes_persoon(actieve_persoon)
+        st.rerun()
 
 zoekterm = st.text_input(
     "Zoeken",
@@ -642,20 +640,25 @@ for _, row in gefilterd.iterrows():
 
     with col_action:
         if gekozen:
-            st.button(
-                "✓ Vastgelegd",
+            if st.button(
+                "✓ Gekozen",
                 key=f"keuze_{actieve_persoon}_{session_id}",
                 type="primary",
-                disabled=True,
                 width="stretch",
-                help="Vastgelegde keuzes kunnen niet worden verwijderd."
-            )
+                help="Klik om je keuze weer weg te halen."
+            ):
+                verwijder_keuze(actieve_persoon, session_id)
+                st.rerun()
         elif st.button(
             "Gaat hierheen",
             key=f"keuze_{actieve_persoon}_{session_id}",
             width="stretch"
         ):
-            st.session_state["te_bevestigen"] = session_id
+            if conflicten_voor_persoon(actieve_persoon, session_id):
+                st.session_state["te_bevestigen"] = session_id
+            else:
+                voeg_keuze_toe(actieve_persoon, session_id)
+
             st.rerun()
 
     st.divider()
