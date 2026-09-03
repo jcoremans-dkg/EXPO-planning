@@ -1,0 +1,12 @@
+# Keuzes van het team: dit hoort niet in de repo.
+data_expo_keuzes.db
+data_expo_keuzes.db-wal
+data_expo_keuzes.db-shm
+
+# Verbindingsgegevens: nooit committen.
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+.venv/
+venv/
