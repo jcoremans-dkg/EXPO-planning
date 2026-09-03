@@ -88,7 +88,9 @@ SLOTEN = [
 ]
 
 
+@st.cache_resource
 def init_db():
+    """Maakt tabellen en sloten aan. Loopt eenmaal per serverproces."""
     with get_engine().begin() as conn:
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS personen (
@@ -109,15 +111,22 @@ def init_db():
                 CREATE OR REPLACE FUNCTION weiger_wijziging()
                 RETURNS trigger AS $weiger$
                 BEGIN
-                    RAISE EXCEPTION '%', TG_ARGV[0];
+                    RAISE EXCEPTION USING MESSAGE = TG_ARGV[0];
                 END;
                 $weiger$ LANGUAGE plpgsql
             """)
 
             for slot, tabel, actie, melding in SLOTEN:
-                conn.exec_driver_sql(
-                    f"DROP TRIGGER IF EXISTS {slot} ON {tabel}"
-                )
+                bestaat = conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_trigger WHERE tgname = :slot"
+                    ),
+                    {"slot": slot}
+                ).first()
+
+                if bestaat:
+                    continue
+
                 conn.exec_driver_sql(f"""
                     CREATE TRIGGER {slot}
                     BEFORE {actie} ON {tabel}
